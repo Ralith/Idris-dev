@@ -290,12 +290,14 @@ codegen tgt defs = Module "idris" (Just . dataLayout $ tgt) (Just . triple $ tgt
     where
       (gendefs, _, globals) = runRWS (mapM cgDef defs) tgt initialMGS
 
+-- All values are passed around as pointers to {tag, data} structs so that defunctionalization can safely tell if something's an application or a value by inspecting tag
 valueType :: Type
 valueType = NamedTypeReference (Name "valTy")
 
 nullValue :: C.Constant
 nullValue = C.Null (PointerType valueType (AddrSpace 0))
 
+-- TODO: Tagged pointers for small prims
 primTy :: Type -> Type
 primTy inner = StructureType False [IntegerType 32, inner]
 
@@ -308,8 +310,13 @@ conType nargs = StructureType False
                 , ArrayType nargs (PointerType valueType (AddrSpace 0))
                 ]
 
+bufferType :: Codegen Type
+bufferType = do
+  sz <- getWordSize
+  return $ StructureType False [IntegerType 32, IntegerType sz, IntegerType sz, ArrayType 0 (IntegerType 8)]
+
 data MGS = MGS { mgsNextGlobalName :: Word
-               , mgsForeignSyms :: Map String (FType, [FType])
+               , mgsForeignSyms :: Map String (Type, [Type])
                }
 
 type Modgen = RWS Target [Definition] MGS
@@ -360,7 +367,7 @@ data CGS = CGS { nextName :: Word
                , currentBlockName :: Name
                , instAccum :: [Named Instruction]
                , lexenv :: Env
-               , foreignSyms :: Map String (FType, [FType])
+               , foreignSyms :: Map String (Type, [Type])
                }
 
 data CGR = CGR { target :: Target
@@ -554,7 +561,6 @@ cgExpr (SProj conVar idx) = do
            Just <$> inst (loadInv ptr)
 cgExpr (SConst c) = Just <$> cgConst c
 cgExpr (SForeign LANG_C rty fname args) = do
-  func <- ensureCDecl fname rty (map fst args)
   argVals <- forM args $ \(fty, v) -> do
                v' <- var v
                case v' of
@@ -563,15 +569,9 @@ cgExpr (SForeign LANG_C rty fname args) = do
   case sequence argVals of
     Nothing -> return Nothing
     Just argVals' -> do
+      func <- ensureCDecl fname (ftyToTy rty) (map (ftyToTy . fst) args)
       argUVals <- mapM (uncurry unbox) argVals'
-      result <- inst Call { isTailCall = False
-                          , callingConvention = CC.C
-                          , returnAttributes = []
-                          , function = Right func
-                          , arguments = map (\v -> (v, [])) argUVals
-                          , functionAttributes = []
-                          , metadata = []
-                          }
+      result <- inst $ simpleCall' func argUVals
       Just <$> box rty result
 cgExpr (SOp fn args) = do
   argVals <- mapM var args
@@ -852,7 +852,7 @@ addGlobal' ty val = do
   return . C.GlobalReference $ name
 
 
-ensureCDecl :: String -> FType -> [FType] -> Codegen Operand
+ensureCDecl :: String -> Type -> [Type] -> Codegen Operand
 ensureCDecl name rty argtys = do
   syms <- gets foreignSyms
   case M.lookup name syms of
@@ -862,13 +862,13 @@ ensureCDecl name rty argtys = do
                             "Mismatched type declarations for foreign symbol \"" ++ name ++ "\": " ++ show (rty, argtys) ++ " vs " ++ show (rty', argtys')
   return $ ConstantOperand (C.GlobalReference (Name name))
 
-ffunDecl :: String -> FType -> [FType] -> Global
+ffunDecl :: String -> Type -> [Type] -> Global
 ffunDecl name rty argtys =
     functionDefaults
-    { G.returnType = ftyToTy rty
+    { G.returnType = rty
     , G.name = Name name
-    , G.parameters = (flip map argtys $ \fty ->
-                          Parameter (ftyToTy fty) (UnName 0) []
+    , G.parameters = (flip map argtys $ \ty ->
+                          Parameter ty (UnName 0) []
                      , False)
     }
 
@@ -1173,8 +1173,87 @@ cgOp LStdErr  [] = do
   ptr <- inst $ loadInv stdErr
   box FPtr ptr
 
+cgOp LAllocate [size] = allocBuffer size
+
+cgOp (LAppend (ITFixed ty) LE) [buf', offset, count, value] = do
+  bufTy <- bufferType
+  buf <- inst $ BitCast buf' (PointerType bufTy (AddrSpace 0)) []
+  fillVal <- bufferFill buf
+  fill <- inst $ Load False fillVal Nothing 0 []
+  cap <- inst . loadInv =<< (bufferCap $ buf)
+  offsetVal <- unbox (FArith (ATInt (ITFixed IT64))) offset
+  countVal <- unbox (FArith (ATInt (ITFixed IT64))) count
+  valueVal <- unbox (FArith (ATInt (ITFixed ty))) value
+  spaceNeeded <- inst $ Mul False True (ConstantOperand (C.Int 64 (fromIntegral (nativeTyWidth ty)))) countVal []
+  newSize <- inst $ Add False True fill spaceNeeded []
+  noRealloc <- inst $ ICmp IPred.ULE spaceNeeded cap []
+  extendName <- getName "buffer_extend"
+  computeNewSizeName <- getName "buffer_compute_new_size"
+  reallocName <- getName "buffer_realloc"
+  startName <- gets currentBlockName
+  finishName <- getName "buffer_finish"
+  memset <- getMemset ty
+  terminate $ CondBr noRealloc extendName computeNewSizeName []
+  do newBlock extendName
+     mem <- bufferMem buf offsetVal
+     ptr <- inst $ BitCast mem (PointerType (ftyToTy (FArith (ATInt (ITFixed ty)))) (AddrSpace 0)) []
+     inst' $ simpleCall' memset [ptr, valueVal, countVal, ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 1 0)]
+     terminate $ Br finishName []
+  newSize <- do newBlock computeNewSizeName
+                newSizeName <- getName "new_size"
+                let newSize = LocalReference newSizeName
+                oldSize <- inst $ Phi (IntegerType 64) [(newSize, computeNewSizeName), (cap, startName)] []
+                wordSize <- getWordSize
+                insts [newSizeName := Mul False True oldSize (ConstantOperand (C.Int wordSize 2)) []]
+                bigEnough <- inst $ ICmp IPred.ULE spaceNeeded newSize []
+                terminate $ CondBr bigEnough reallocName computeNewSizeName []
+                return newSize
+  newBuf' <- do newBlock reallocName
+                newBuf' <- allocBuffer newSize
+                newBuf <- inst $ BitCast newBuf' (PointerType bufTy (AddrSpace 0)) []
+                newMem <- bufferMem newBuf (ConstantOperand (C.Int 64 0))
+                oldMem <- bufferMem buf (ConstantOperand (C.Int 64 0))
+                inst' $ simpleCall "memcpy" [newMem, oldMem, fill]
+                mem <- bufferMem newBuf fill
+                ptr <- inst $ BitCast mem (PointerType (ftyToTy (FArith (ATInt (ITFixed ty)))) (AddrSpace 0)) []
+                inst' $ simpleCall' memset [ptr, valueVal, countVal, ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 1 0)]
+                terminate $ Br finishName []
+                return newBuf'
+  newBlock finishName
+  inst $ Phi valueType [(buf', extendName), (newBuf', reallocName)] []
+
 cgOp prim args = ierror $ "Unimplemented primitive: <" ++ show prim ++ ">("
                   ++ intersperse ',' (take (length args) ['a'..]) ++ ")"
+
+getMemset :: NativeTy -> Codegen Operand
+getMemset nty = let ty = ftyToTy (FArith (ATInt (ITFixed nty)))
+                in ensureCDecl ("llvm.memset.p0i" ++ show (nativeTyWidth nty) ++ ".i64") VoidType
+                               [ PointerType ty (AddrSpace 0), ty, IntegerType 64
+                               , IntegerType 32, IntegerType 1
+                               ]
+
+bufferFill :: Operand -> Codegen Operand
+bufferFill buf = inst $ GetElementPtr True buf [ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 32 1)] []
+
+bufferCap :: Operand -> Codegen Operand
+bufferCap buf = inst $ GetElementPtr True buf [ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 32 2)] []
+
+bufferMem :: Operand -> Operand -> Codegen Operand
+bufferMem buf index = inst $ GetElementPtr True buf [ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 32 3), index] []
+
+allocBuffer :: Operand -> Codegen Operand
+allocBuffer bytes = do
+  ty <- bufferType
+  tySize <- sizeOf ty
+  mem <- allocAtomic' =<< (inst $ Add False True tySize bytes [])
+  buf <- inst $ BitCast mem ty []
+  tagptr <- inst $ GetElementPtr True buf [ConstantOperand (C.Int 32 0), ConstantOperand (C.Int 32 0)] []
+  inst' $ Store False tagptr (ConstantOperand (C.Int 32 (-1))) Nothing 0 []
+  fillptr <- bufferFill buf
+  inst' $ Store False fillptr (ConstantOperand (C.Int 32 0)) Nothing 0 []
+  capptr <- bufferCap buf
+  inst' $ Store False capptr bytes Nothing 0 []
+  inst $ BitCast buf (PointerType valueType (AddrSpace 0)) []
 
 iCoerce :: (Operand -> Type -> InstructionMetadata -> Instruction) -> NativeTy -> NativeTy -> Operand -> Codegen Operand
 iCoerce _ from to x | from == to = return x
@@ -1282,11 +1361,14 @@ mpzCmp pred x y = do
   box (FArith (ATInt (ITFixed IT32))) i
 
 simpleCall :: String -> [Operand] -> Instruction
-simpleCall name args =
+simpleCall = simpleCall' . ConstantOperand . C.GlobalReference . Name
+
+simpleCall' :: Operand -> [Operand] -> Instruction
+simpleCall' func args =
     Call { isTailCall = False
          , callingConvention = CC.C
          , returnAttributes = []
-         , function = Right . ConstantOperand . C.GlobalReference . Name $ name
+         , function = Right func
          , arguments = map (\x -> (x, [])) args
          , functionAttributes = []
          , metadata = []
